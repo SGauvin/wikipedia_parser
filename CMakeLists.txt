@@ -13,3 +13,7 @@ find_package(CURL REQUIRED)
 include_directories(${CURL_INCLUDE_DIR})
 target_link_libraries(${CMAKE_PROJECT_NAME} ${CURL_LIBRARIES})
 
+# ENGINE
+add_subdirectory(libs/lexbor)
+target_link_libraries(${CMAKE_PROJECT_NAME} lexbor_static)
+include_directories(libs/lexbor/source)
