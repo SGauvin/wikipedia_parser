@@ -1,7 +1,0 @@
-[
-{
-  "directory": "/home/simon/Documents/wikipedia_parser/build",
-  "command": "/usr/bin/c++  -I/home/simon/Documents/wikipedia_parser/include -O3 -DNDEBUG -std=gnu++20 -o CMakeFiles/wikipedia_parser.dir/src/main.cpp.o -c /home/simon/Documents/wikipedia_parser/src/main.cpp",
-  "file": "/home/simon/Documents/wikipedia_parser/src/main.cpp"
-}
-]
