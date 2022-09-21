@@ -1,0 +1,3 @@
+/home/simon/Documents/wikipedia_parser/build/CMakeFiles/wikipedia_parser.dir
+/home/simon/Documents/wikipedia_parser/build/CMakeFiles/edit_cache.dir
+/home/simon/Documents/wikipedia_parser/build/CMakeFiles/rebuild_cache.dir
