@@ -12,6 +12,7 @@
 #include <curl/curl.h>
 #include <lexbor/html/parser.h>
 #include <lexbor/dom/dom.h>
+#include "lexbor/dom/collection.h"
 
 std::size_t writeFunction(void* ptr, std::size_t size, std::size_t nmemb, std::string* data)
 {
@@ -43,27 +44,40 @@ void extractLinks(const std::string& htmlContent, std::vector<std::string>& link
     }
 }
 
-void extractLinksLegit(const std::string& htmlContent, std::vector<std::string>& links, lxb_html_document_t& document) noexcept
+void extractLinksLegit(const std::string& htmlContent, std::vector<std::string>& links, lxb_html_document_t& document, lxb_dom_collection_t& collection) noexcept
 {
-    links.clear();
-    std::cout << "test" << std::endl;
     auto status = lxb_html_document_parse(&document, reinterpret_cast<const std::uint8_t*>(htmlContent.c_str()), htmlContent.size());
-    std::cout << "test2" << std::endl;
     if (status != LXB_STATUS_OK)
     {
-        std::cerr << "ntm" << std::endl;
+        std::cerr << "Error" << std::endl;
+        return;
+    }
+    std::cout << 5 << std::endl;
+
+    auto body = lxb_dom_interface_element(document.body);
+    std::cout << 6 << std::endl;
+
+    collection.array.length = 0;
+    status = lxb_dom_elements_by_attr_begin(body, &collection, (const lxb_char_t *) "href", 4, (const lxb_char_t *) "/wiki", 5, true);
+    std::cout << 7 << std::endl;
+    if (status != LXB_STATUS_OK)
+    {
+        std::cerr << "Error" << std::endl;
         return;
     }
 
-    auto body = lxb_dom_interface_document(document.body);
-    auto collection = lxb_dom_collection_make(&document.dom_document, 128);
-
-    if (collection == NULL) {
-        std::cerr << "Bruh" << std::endl;
-        return;
+    std::cout << 8 << std::endl;
+    links.clear();
+    for (size_t i = 0; i < lxb_dom_collection_length(&collection); i++) {
+        auto element = lxb_dom_collection_element(&collection, i);
+        const unsigned char* link = lxb_dom_element_get_attribute(element, reinterpret_cast<const unsigned char*>("href"), 4, nullptr);
+        links.push_back(std::string(reinterpret_cast<const char*>(link)));
     }
-
-    std::cout << "Fuck you" <<std::endl;
+    std::cout << 9 << std::endl;
+    lxb_html_document_destroy(&document);
+    document = *lxb_html_document_create();
+    lxb_dom_collection_destroy(&collection, true);
+    collection = *lxb_dom_collection_make(&document.dom_document, 4096);
 }
 
 void run(CURL* curl, const char* url, std::string& responseString, lxb_html_document_t& document)
@@ -73,23 +87,27 @@ void run(CURL* curl, const char* url, std::string& responseString, lxb_html_docu
 
     std::string currentUrl = std::string(url);
 
-    auto start = std::chrono::high_resolution_clock::now();
     std::vector<std::string> links{};
     links.reserve(4096);
+    auto collection = lxb_dom_collection_make(&document.dom_document, 4096);
 
+    auto start = std::chrono::high_resolution_clock::now();
     do
     {
         curl_easy_setopt(curl, CURLOPT_URL, std::string("https://en.wikipedia.org" + currentUrl).c_str());
         curl_easy_perform(curl);
         visited.insert(currentUrl);
         // extractLinks(responseString, links);
-        extractLinksLegit(responseString, links, document);
+        std::cout << "Patnais" << std::endl;
+        extractLinksLegit(responseString, links, document, *collection);
+        std::cout << "Patnais2" << std::endl;
         responseString.clear();
         toVisit.insert(toVisit.end(), links.begin(), links.end());
 
         auto end = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         start = end;
+        std::cout << "Patnais3" << std::endl;
 
         std::cout << "[" << visited.size() << "] [" << links.size() << "] "
                   << "Visited " << currentUrl << " in " << elapsed.count() << "ms" << std::endl;
@@ -103,8 +121,11 @@ void run(CURL* curl, const char* url, std::string& responseString, lxb_html_docu
             }
             currentUrl = toVisit.front();
             toVisit.pop_front();
+            std::cout << "Patnais4" << std::endl;
         } while (visited.contains(currentUrl));
     } while (toVisit.empty() == false);
+
+    // lxb_dom_collection_destroy(collection, true);
 }
 
 std::tuple<CURL*, std::unique_ptr<std::string>> initCurl()
