@@ -23,29 +23,31 @@ void fetchPages(LinksToCurlQueue& inQueue, HtmlToParseQueue& outQueue)
         curl_easy_setopt(curl, CURLOPT_URL, std::string("https://en.wikipedia.org" + toFetch).c_str());
         curl_easy_perform(curl);
         auto end = std::chrono::high_resolution_clock::now();
-        std::cout << "Fetched " << toFetch << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms\n";
+        std::cout << "Fetched " << toFetch << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
+                  << " ms\n";
         outQueue.push(*responseString);
+        std::cout << "Waited "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - end).count()
+                  << " ms to push\n";
     }
 }
 
 void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue)
 {
     std::string responseString;
+    auto document = lxb_html_document_create();
+    auto collection = lxb_dom_collection_make(lxb_dom_interface_document(document), 128);
     while (true)
     {
         inQueue.pop(responseString);
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        auto document = lxb_html_document_create();
-        auto collection = lxb_dom_collection_make(lxb_dom_interface_document(document), 128);
         auto status = lxb_html_document_parse(document, (const unsigned char*)responseString.c_str(), responseString.size());
 
         if (status != LXB_STATUS_OK)
         {
             std::cerr << "Error while parsing HTML" << std::endl;
-            lxb_dom_collection_destroy(collection, false);
-            lxb_html_document_destroy(document);
             continue;
         }
 
@@ -55,8 +57,6 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue)
         if (status != LXB_STATUS_OK)
         {
             std::cerr << "Error while parsing HTML" << std::endl;
-            lxb_dom_collection_destroy(collection, false);
-            lxb_html_document_destroy(document);
             continue;
         }
 
@@ -64,16 +64,21 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue)
         for (size_t i = 0; i < lxb_dom_collection_length(collection); i++)
         {
             auto element = lxb_dom_collection_element(collection, i);
-            const char* link = (const char*)lxb_dom_element_get_attribute(element, reinterpret_cast<const unsigned char*>("href"), 4, nullptr);
+            const char* link =
+                (const char*)lxb_dom_element_get_attribute(element, reinterpret_cast<const unsigned char*>("href"), 4, nullptr);
             outQueue.push(std::string((const char*)link));
         }
 
-        lxb_dom_collection_destroy(collection, false);
-        lxb_html_document_destroy(document);
-
         auto end = std::chrono::high_resolution_clock::now();
-        // std::cout << "Parsed " << num << " links in " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms\n";
+        // std::cout << "Parsed " << num << " links in " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "
+        // ms\n";
+
+        lxb_dom_collection_clean(collection);
+        lxb_html_document_clean(document);
     }
+
+    lxb_dom_collection_destroy(collection, true);
+    lxb_html_document_destroy(document);
 }
 
 void filterLinks(LinksToFilterQueue& inQueue, LinksToCurlQueue& outQueue)
@@ -115,12 +120,12 @@ int main(int argc, char** argv)
 
     std::vector<std::thread> threads;
     threads.reserve(60);
-    for (auto i = 0UL; i < 40; i++)
+    for (auto i = 0UL; i < 15; i++)
     {
         threads.emplace_back(fetchPages, std::ref(toCurl), std::ref(toParse));
     }
 
-    for (auto i = 0UL; i < 10; i++)
+    for (auto i = 0UL; i < 3; i++)
     {
         threads.emplace_back(parseHtml, std::ref(toParse), std::ref(toFilter));
     }

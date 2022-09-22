@@ -24,7 +24,7 @@ BreakBeforeTernaryOperators: false
 BreakConstructorInitializers: BeforeComma
 BreakInheritanceList: BeforeComma
 BreakStringLiterals: true
-ColumnLimit: 160
+ColumnLimit: 140
 CommentPragmas: '^ IWYU pragma:'
 CompactNamespaces: false
 ConstructorInitializerAllOnOneLineOrOnePerLine: false
