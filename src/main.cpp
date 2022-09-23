@@ -62,8 +62,6 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
         }
         const auto& [pageName, responseString] = fetchedData;
 
-        auto start = std::chrono::high_resolution_clock::now();
-
         auto status = lxb_html_document_parse(document, (const unsigned char*)responseString.c_str(), responseString.size());
 
         if (status != LXB_STATUS_OK)
@@ -83,11 +81,6 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
 
         links.clear();
         bool quit = false;
-        // if (lxb_dom_collection_length(collection) == 0)
-        // {
-        //     inQueue.quit();
-        //     std::cout << "No links in page (" << pageName << "), we are probably getting throttled\n" << std::endl;
-        // }
         for (size_t i = 0; i < lxb_dom_collection_length(collection); i++)
         {
             auto element = lxb_dom_collection_element(collection, i);
@@ -125,15 +118,22 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
     lxb_html_document_destroy(document);
 }
 
-void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue)
+void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, LinksToCurlQueue& curlQueue, std::condition_variable& deserializeCondition)
 {
     std::unordered_set<std::string> visited{};
     std::string toFilter;
     std::size_t totalMs;
     std::size_t n{};
+    auto start = std::chrono::high_resolution_clock::now();
 
     while (true)
     {
+        const float fullness = static_cast<float>(curlQueue.size()) / curlQueue.capacity();
+        if (fullness < 0.75f)
+        {
+            deserializeCondition.notify_one();
+        }
+
         if (inQueue.pop(toFilter))
         {
             outQueue.quit();
@@ -148,6 +148,26 @@ void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue)
         }
 
         if (visited.contains(toFilter))
+        {
+            continue;
+        }
+
+        if (toFilter.starts_with("/wiki/Category:"))
+        {
+            continue;
+        }
+
+        if (toFilter.starts_with("/wiki/File:"))
+        {
+            continue;
+        }
+
+        if (toFilter.starts_with("/wiki/Wikipedia:"))
+        {
+            continue;
+        }
+
+        if (toFilter.starts_with("/wiki/Special:"))
         {
             continue;
         }
@@ -168,7 +188,7 @@ void dispatchLinks(LinksToDispatchQueue& inQueue, LinksToCurlQueue& curlQueue, L
     std::string link;
     while (true)
     {
-        const float fullness = static_cast<float>(inQueue.size()) / inQueue.capacity();
+        const float fullness = static_cast<float>(curlQueue.size()) / curlQueue.capacity();
         if (fullness < 0.75f)
         {
             deserializeCondition.notify_one();
@@ -251,7 +271,7 @@ void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlQueue& curlQu
         deserializeCondition.wait(guard,
                                   [&]
                                   {
-                                      const float fullness = static_cast<float>(toDispatch.size() - 1) / toDispatch.capacity();
+                                      const float fullness = static_cast<float>(curlQueue.size() - 1) / curlQueue.capacity();
                                       return fullness < 0.80f || quitDeserialize == true;
                                   });
 
@@ -292,6 +312,7 @@ void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlQueue& curlQu
 
         std::string link;
         bool quit = false;
+        std::cout << "Deserializing page << " << pathStr << "\n";
         while (stream >> link)
         {
             if (curlQueue.push(link))
@@ -321,10 +342,9 @@ void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlQueue& curlQu
     }
 }
 
-void serializePage(PagesToSerializeQueue& inQueue, const std::string& dataFolder)
+void serializePage(PagesToSerializeQueue& inQueue, const std::string& dataFolder, std::atomic<std::uint32_t>& pageCounter)
 {
     std::pair<std::string, std::string> toSerialize;
-    std::uint32_t count = 0;
 
     auto start = std::chrono::high_resolution_clock::now();
     while (true)
@@ -355,11 +375,7 @@ void serializePage(PagesToSerializeQueue& inQueue, const std::string& dataFolder
         }
 
         stream << pageLinks;
-        count++;
-
-        // std::cout << static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - start).count()) /
-        //                  count
-        //           << " ms avg" << std::endl;
+        pageCounter++;
     }
 }
 
@@ -406,12 +422,12 @@ int main(int argc, char** argv)
     }
 
     // Filter thread (did we already visit that link?)
+    std::condition_variable deserializeCondition;
     LinksToDispatchQueue toDispatch{};
-    threads.emplace_back(filterLinks, std::ref(toFilter), std::ref(toDispatch));
+    threads.emplace_back(filterLinks, std::ref(toFilter), std::ref(toDispatch), std::ref(toCurl), std::ref(deserializeCondition));
 
     // Dispatching threads (should a link be serialized or be kept in memory?)
     LinksToSerializeQueue toSerialize{};
-    std::condition_variable deserializeCondition;
     std::atomic<bool> quitDeserialize = false;
     threads.emplace_back(dispatchLinks, std::ref(toDispatch), std::ref(toCurl), std::ref(toSerialize), std::ref(deserializeCondition), std::ref(quitDeserialize));
 
@@ -432,19 +448,14 @@ int main(int argc, char** argv)
                          std::ref(quitDeserialize),
                          std::ref(linksFolder));
 
-    threads.emplace_back(serializePage, std::ref(pagesToSerialize), std::ref(dataFolder));
+    std::atomic<std::uint32_t> pageSerializingCounter = 0;
+    threads.emplace_back(serializePage, std::ref(pagesToSerialize), std::ref(dataFolder), std::ref(pageSerializingCounter));
 
     // Every 10 seconds check if we have finished
     std::uint8_t count = 0;
     while (true)
     {
-        std::cout << "To curl:             " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
-        std::cout << "To parse:            " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
-        std::cout << "To filter:           " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
-        std::cout << "To dispatch:         " << static_cast<float>(toDispatch.size()) / toDispatch.capacity() << '\n';
-        std::cout << "To serialize:        " << static_cast<float>(toSerialize.size()) / toSerialize.capacity() << '\n';
-        std::cout << "To serialize pages:  " << static_cast<float>(pagesToSerialize.size()) / pagesToSerialize.capacity() << '\n';
-        std::cout << "---\n";
+        auto start = std::chrono::high_resolution_clock::now();
 
         std::this_thread::sleep_for(std::chrono::seconds(5));
         if (toCurl.size() == 0 && pagesToSerialize.size() == 0)
@@ -459,6 +470,21 @@ int main(int argc, char** argv)
         {
             count = 0;
         }
+
+        std::uint32_t pageCount = pageSerializingCounter;
+        pageSerializingCounter = 0;
+        auto now = std::chrono::high_resolution_clock::now();
+        auto duration = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
+        auto averageDuration = duration / pageCount;
+        
+        std::cout << "To curl:                " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
+        std::cout << "To parse:               " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
+        std::cout << "To filter:              " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
+        std::cout << "To dispatch:            " << static_cast<float>(toDispatch.size()) / toDispatch.capacity() << '\n';
+        std::cout << "To serialize:           " << static_cast<float>(toSerialize.size()) / toSerialize.capacity() << '\n';
+        std::cout << "To serialize pages:     " << static_cast<float>(pagesToSerialize.size()) / pagesToSerialize.capacity() << '\n';
+        std::cout << "Fetch duration average: " << averageDuration << "ms\n";
+        std::cout << "---\n";
     }
 
     std::cout << "Terminating" << std::endl;
