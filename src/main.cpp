@@ -92,6 +92,10 @@ void throttleFetch(std::chrono::microseconds durationToWaitBetweenSends, std::ui
         auto timeToSleepThisLoop = std::chrono::duration_cast<std::chrono::microseconds>(durationToWaitBetweenSends - duration);
 
         timeToSleepTotal += timeToSleepThisLoop;
+        if (timeToSleepTotal.count() < -1000)
+        {
+            timeToSleepTotal = std::chrono::microseconds(-1000);
+        }
         timestamp = now;
 
         if (timeToSleepTotal.count() > 0)
@@ -550,7 +554,7 @@ int main(int argc, char** argv)
     LinksToCurlQueue toCurl{};
     LinksToCurlThrottleQueue toCurlThrottle{};
     toCurlThrottle.push(std::string(argc <= 2 ? "/wiki/Sun" : argv[1]));
-    threads.emplace_back(throttleFetch, std::chrono::milliseconds(1000), 1, std::ref(toCurlThrottle), std::ref(toCurl));
+    threads.emplace_back(throttleFetch, std::chrono::milliseconds(250), 2, std::ref(toCurlThrottle), std::ref(toCurl));
 
     // Curl threads
     std::atomic<std::uint64_t> throttleQuantity = 0;
@@ -610,7 +614,7 @@ int main(int argc, char** argv)
     std::atomic<std::uint32_t> pageSerializingCounter = 0;
     threads.emplace_back(serializePage, std::ref(pagesToSerialize), std::ref(dataFolder), std::ref(pageSerializingCounter));
 
-    // Every 10 seconds check if we have finished
+    // Every 5 seconds check if we have finished
     std::uint8_t count = 0;
     while (true)
     {
