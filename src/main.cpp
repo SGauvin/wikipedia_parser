@@ -5,6 +5,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <curl/curl.h>
 #include <lexbor/dom/collection.h>
 #include <lexbor/dom/dom.h>
 #include <lexbor/html/parser.h>
@@ -173,7 +174,7 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
             if (std::string_view(title, titleLen) == "Wikimedia Error")
             {
                 // WE ARE GETTING THROTTLED
-                std::cout << "GETTING THROTTLED!!! SLOWING DOWN!\n";
+                std::cout << "GETTING THROTTLED!!!\n";
                 throttleQuantity += numberOfCurlThreads * 4;
                 // Put back the link in the queue to re fetch later
                 outQueue.push(pageName);
@@ -237,8 +238,6 @@ void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, Li
     disallowedLinks.push_back("/wiki/Category:");
     disallowedLinks.push_back("/wiki/File:");
     disallowedLinks.push_back("/wiki/Wikipedia:");
-
-    auto start = std::chrono::high_resolution_clock::now();
 
     while (true)
     {
@@ -554,13 +553,13 @@ int main(int argc, char** argv)
     LinksToCurlQueue toCurl{};
     LinksToCurlThrottleQueue toCurlThrottle{};
     toCurlThrottle.push(std::string(argc <= 2 ? "/wiki/Sun" : argv[1]));
-    threads.emplace_back(throttleFetch, std::chrono::milliseconds(250), 2, std::ref(toCurlThrottle), std::ref(toCurl));
+    threads.emplace_back(throttleFetch, std::chrono::milliseconds(0), 2, std::ref(toCurlThrottle), std::ref(toCurl));
 
     // Curl threads
     std::atomic<std::uint64_t> throttleQuantity = 0;
     HtmlToParseQueue toParse{};
     const std::uint8_t numberOfCurlThreads = 30;
-    for (auto i = 0UL; i < 30; i++)
+    for (auto i = 0UL; i < numberOfCurlThreads; i++)
     {
         threads.emplace_back(fetchPages, std::ref(toCurl), std::ref(toParse), std::ref(throttleQuantity));
     }
@@ -613,9 +612,11 @@ int main(int argc, char** argv)
 
     std::atomic<std::uint32_t> pageSerializingCounter = 0;
     threads.emplace_back(serializePage, std::ref(pagesToSerialize), std::ref(dataFolder), std::ref(pageSerializingCounter));
+    auto timestampAtStart = std::chrono::high_resolution_clock::now();
 
     // Every 5 seconds check if we have finished
     std::uint8_t count = 0;
+    std::uint64_t totalPagesSerialized = 0;
     while (true)
     {
         auto start = std::chrono::high_resolution_clock::now();
@@ -634,21 +635,27 @@ int main(int argc, char** argv)
             count = 0;
         }
 
-        std::uint32_t pageCount = pageSerializingCounter;
-        pageSerializingCounter = 0;
+        std::uint32_t pageCount = pageSerializingCounter.load(std::memory_order_relaxed);
+        while(!pageSerializingCounter.compare_exchange_weak(pageCount, 0, std::memory_order_relaxed, std::memory_order_relaxed));
+        totalPagesSerialized += pageCount;
+
         auto now = std::chrono::high_resolution_clock::now();
-        auto duration = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
-        auto averageDuration = duration / pageCount;
+        auto durationSinceLast = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
+        auto averageDuration = durationSinceLast / pageCount;
+        auto durationSinceStart = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(now - timestampAtStart).count());
 
         std::cout << "Queues fullness:\n";
-        std::cout << "To curl (throttled):    " << static_cast<float>(toCurlThrottle.size()) / toCurlThrottle.capacity() << '\n';
-        std::cout << "To curl :               " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
-        std::cout << "To parse:               " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
-        std::cout << "To filter:              " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
-        std::cout << "To dispatch:            " << static_cast<float>(toDispatch.size()) / toDispatch.capacity() << '\n';
-        std::cout << "To serialize:           " << static_cast<float>(toSerialize.size()) / toSerialize.capacity() << '\n';
-        std::cout << "To serialize pages:     " << static_cast<float>(pagesToSerialize.size()) / pagesToSerialize.capacity() << '\n';
-        std::cout << "Fetch duration average: " << averageDuration << "ms\n";
+        std::cout << "To curl (throttled):      " << static_cast<float>(toCurlThrottle.size()) / toCurlThrottle.capacity() << '\n';
+        std::cout << "To curl :                 " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
+        std::cout << "To parse:                 " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
+        std::cout << "To filter:                " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
+        std::cout << "To dispatch:              " << static_cast<float>(toDispatch.size()) / toDispatch.capacity() << '\n';
+        std::cout << "To serialize:             " << static_cast<float>(toSerialize.size()) / toSerialize.capacity() << '\n';
+        std::cout << "To serialize pages:       " << static_cast<float>(pagesToSerialize.size()) / pagesToSerialize.capacity() << '\n';
+        std::cout << "Number of fetches:        " << pageCount << " in the last " << durationSinceLast / 1000 << "s\n";
+        std::cout << "Fetch duration average:   " << averageDuration << "ms\n";
+        std::cout << "Total pages serialized:   " << totalPagesSerialized << '\n';
+        std::cout << "Time elapsed since start: " << durationSinceStart / 1000 << "s\n";
         std::cout << "---\n";
     }
 
