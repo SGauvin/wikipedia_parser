@@ -1,7 +1,7 @@
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <cmath>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -11,7 +11,8 @@
 #include "init_curl.h"
 #include "thread_safe_queue.h"
 
-using LinksToCurlQueue = ThreadSafeQueueFixedSize<std::string, 4096 * 4>;
+using LinksToCurlThrottleQueue = ThreadSafeQueueFixedSize<std::string, 4096 * 4>;
+using LinksToCurlQueue = ThreadSafeQueueFixedSize<std::string, 256>;
 using HtmlToParseQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 64>;
 using LinksToFilterQueue = ThreadSafeQueueFixedSize<std::string, 4096>;
 using LinksToDispatchQueue = ThreadSafeQueueFixedSize<std::string, 2048>;
@@ -32,19 +33,88 @@ void fetchPages(LinksToCurlQueue& inQueue, HtmlToParseQueue& outQueue, std::atom
             break;
         }
 
-        std::uint64_t throttleQuantityAtomic = throttleQuantity.load(std::memory_order_relaxed);
-        auto throttleBeforeDecrement = throttleQuantityAtomic;
-        while (!throttleQuantity.compare_exchange_weak(throttleQuantityAtomic, throttleQuantityAtomic == 0 ? 0 : throttleQuantityAtomic - 1))
+        responseString->clear();
+        curl_easy_setopt(curl, CURLOPT_URL, std::string("https://en.wikipedia.org" + toFetch).c_str());
+        curl_easy_perform(curl);
+        auto end = std::chrono::high_resolution_clock::now();
+        if (outQueue.push({toFetch, *responseString}))
         {
+            inQueue.quit();
+            std::cout << "Terminating fetch" << std::endl;
+            break;
+        }
+    }
+    curl_easy_cleanup(curl);
+}
+
+void throttleFetch(std::chrono::microseconds durationToWaitBetweenSends, std::uint32_t sendCount, LinksToCurlThrottleQueue& inQueue,
+                   LinksToCurlQueue& outQueue)
+{
+    if (durationToWaitBetweenSends.count() == 0.0)
+    {
+        std::string link;
+        while (true)
+        {
+            if (inQueue.pop(link))
+            {
+                outQueue.quit();
+                break;
+            }
+
+            if (outQueue.push(link))
+            {
+                inQueue.quit();
+                break;
+            }
+        }
+        return;
+    }
+
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    auto timeToSleepTotal = std::chrono::microseconds(0);
+    std::string link;
+    while (true)
+    {
+        if (inQueue.pop(link))
+        {
+            outQueue.quit();
+            break;
         }
 
-        if (throttleBeforeDecrement > 0)
+        if (outQueue.push(link))
         {
-            std::uint64_t toSleepForMs = std::ceil(static_cast<float>(throttleBeforeDecrement) / 30) * 20;
-            std::this_thread::sleep_for(std::chrono::milliseconds(toSleepForMs));
+            inQueue.quit();
+            break;
         }
 
-        auto start = std::chrono::high_resolution_clock::now();
+        auto now = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(now - timestamp);
+        auto timeToSleepThisLoop = std::chrono::duration_cast<std::chrono::microseconds>(durationToWaitBetweenSends - duration);
+
+        timeToSleepTotal += timeToSleepThisLoop;
+        timestamp = now;
+
+        if (timeToSleepTotal.count() > 0)
+        {
+            std::this_thread::sleep_for(timeToSleepTotal);
+        }
+    }
+}
+
+void dispatchLinksToCurl(LinksToCurlThrottleQueue& inQueue, HtmlToParseQueue& outQueue, std::atomic<std::uint64_t>& throttleQuantity)
+{
+    auto [curl, responseString] = initCurl();
+    std::string toFetch;
+
+    while (true)
+    {
+        if (inQueue.pop(toFetch))
+        {
+            outQueue.quit();
+            std::cout << "Terminating fetch" << std::endl;
+            break;
+        }
+
         responseString->clear();
         curl_easy_setopt(curl, CURLOPT_URL, std::string("https://en.wikipedia.org" + toFetch).c_str());
         curl_easy_perform(curl);
@@ -67,7 +137,6 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
 
     auto document = lxb_html_document_create();
     auto collection = lxb_dom_collection_make(lxb_dom_interface_document(document), 128);
-
     while (true)
     {
         lxb_dom_collection_clean(collection);
@@ -153,7 +222,7 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
     lxb_html_document_destroy(document);
 }
 
-void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, LinksToCurlQueue& curlQueue,
+void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, LinksToCurlThrottleQueue& curlQueue,
                  std::condition_variable& deserializeCondition, std::vector<std::string>& disallowedLinks)
 {
     std::unordered_set<std::string> visited{};
@@ -212,7 +281,7 @@ void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, Li
     }
 }
 
-void dispatchLinks(LinksToDispatchQueue& inQueue, LinksToCurlQueue& curlQueue, LinksToSerializeQueue& serializeQueue,
+void dispatchLinks(LinksToDispatchQueue& inQueue, LinksToCurlThrottleQueue& curlQueue, LinksToSerializeQueue& serializeQueue,
                    std::condition_variable& deserializeCondition, std::atomic<bool>& quitDeserialize)
 {
     std::string link;
@@ -291,7 +360,7 @@ void serializeLinks(LinksToSerializeQueue& inQueue, const std::string& linksFold
     }
 }
 
-void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlQueue& curlQueue, std::unordered_set<std::string>& activeFiles,
+void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue& curlQueue, std::unordered_set<std::string>& activeFiles,
                       std::mutex& filemutex, std::mutex& conditionMutex, std::condition_variable& deserializeCondition,
                       std::atomic<bool>& quitDeserialize, const std::string& linksFolder)
 {
@@ -477,12 +546,15 @@ int main(int argc, char** argv)
     std::vector<std::thread> threads;
     threads.reserve(64);
 
-    // Curl threads
-
-    std::atomic<std::uint64_t> throttleQuantity = 0;
+    // Throttle
     LinksToCurlQueue toCurl{};
+    LinksToCurlThrottleQueue toCurlThrottle{};
+    toCurlThrottle.push(std::string(argc <= 2 ? "/wiki/Sun" : argv[1]));
+    threads.emplace_back(throttleFetch, std::chrono::milliseconds(1000), 1, std::ref(toCurlThrottle), std::ref(toCurl));
+
+    // Curl threads
+    std::atomic<std::uint64_t> throttleQuantity = 0;
     HtmlToParseQueue toParse{};
-    toCurl.push(std::string(argc <= 2 ? "/wiki/Sun" : argv[1]));
     const std::uint8_t numberOfCurlThreads = 30;
     for (auto i = 0UL; i < 30; i++)
     {
@@ -501,15 +573,19 @@ int main(int argc, char** argv)
     // Filter thread (did we already visit that link?)
     std::condition_variable deserializeCondition;
     LinksToDispatchQueue toDispatch{};
-    threads.emplace_back(
-        filterLinks, std::ref(toFilter), std::ref(toDispatch), std::ref(toCurl), std::ref(deserializeCondition), std::ref(disallowedLinks));
+    threads.emplace_back(filterLinks,
+                         std::ref(toFilter),
+                         std::ref(toDispatch),
+                         std::ref(toCurlThrottle),
+                         std::ref(deserializeCondition),
+                         std::ref(disallowedLinks));
 
     // Dispatching threads (should a link be serialized or be kept in memory?)
     LinksToSerializeQueue toSerialize{};
     std::atomic<bool> quitDeserialize = false;
     threads.emplace_back(dispatchLinks,
                          std::ref(toDispatch),
-                         std::ref(toCurl),
+                         std::ref(toCurlThrottle),
                          std::ref(toSerialize),
                          std::ref(deserializeCondition),
                          std::ref(quitDeserialize));
@@ -523,7 +599,7 @@ int main(int argc, char** argv)
     std::mutex conditionMutex;
     threads.emplace_back(deserializeLinks,
                          std::ref(toDispatch),
-                         std::ref(toCurl),
+                         std::ref(toCurlThrottle),
                          std::ref(activeFiles),
                          std::ref(fileMutex),
                          std::ref(conditionMutex),
@@ -541,7 +617,7 @@ int main(int argc, char** argv)
         auto start = std::chrono::high_resolution_clock::now();
 
         std::this_thread::sleep_for(std::chrono::seconds(5));
-        if (toCurl.size() == 0 && pagesToSerialize.size() == 0)
+        if (toCurlThrottle.size() == 0 && pagesToSerialize.size() == 0)
         {
             count++;
             if (count == 3)
@@ -561,7 +637,8 @@ int main(int argc, char** argv)
         auto averageDuration = duration / pageCount;
 
         std::cout << "Queues fullness:\n";
-        std::cout << "To curl:                " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
+        std::cout << "To curl (throttled):    " << static_cast<float>(toCurlThrottle.size()) / toCurlThrottle.capacity() << '\n';
+        std::cout << "To curl :               " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
         std::cout << "To parse:               " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
         std::cout << "To filter:              " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
         std::cout << "To dispatch:            " << static_cast<float>(toDispatch.size()) / toDispatch.capacity() << '\n';
