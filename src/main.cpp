@@ -1,6 +1,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <cmath>
+#include <sstream>
+#include <string>
 #include <unordered_set>
 #include <lexbor/dom/collection.h>
 #include <lexbor/dom/dom.h>
@@ -8,14 +11,14 @@
 #include "init_curl.h"
 #include "thread_safe_queue.h"
 
-using LinksToCurlQueue = ThreadSafeQueueFixedSize<std::string, 4096 * 16>;
+using LinksToCurlQueue = ThreadSafeQueueFixedSize<std::string, 4096 * 4>;
 using HtmlToParseQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 64>;
-using LinksToFilterQueue = ThreadSafeQueueFixedSize<std::string, 4096 * 16>;
+using LinksToFilterQueue = ThreadSafeQueueFixedSize<std::string, 4096>;
 using LinksToDispatchQueue = ThreadSafeQueueFixedSize<std::string, 2048>;
-using LinksToSerializeQueue = ThreadSafeQueueFixedSize<std::string, 4096 * 4>;
+using LinksToSerializeQueue = ThreadSafeQueueFixedSize<std::string, 4096>;
 using PagesToSerializeQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 256>;
 
-void fetchPages(LinksToCurlQueue& inQueue, HtmlToParseQueue& outQueue)
+void fetchPages(LinksToCurlQueue& inQueue, HtmlToParseQueue& outQueue, std::atomic<std::uint64_t>& throttleQuantity)
 {
     auto [curl, responseString] = initCurl();
     std::string toFetch;
@@ -28,6 +31,19 @@ void fetchPages(LinksToCurlQueue& inQueue, HtmlToParseQueue& outQueue)
             std::cout << "Terminating fetch" << std::endl;
             break;
         }
+
+        std::uint64_t throttleQuantityAtomic = throttleQuantity.load(std::memory_order_relaxed);
+        auto throttleBeforeDecrement = throttleQuantityAtomic;
+        while (!throttleQuantity.compare_exchange_weak(throttleQuantityAtomic, throttleQuantityAtomic == 0 ? 0 : throttleQuantityAtomic - 1))
+        {
+        }
+
+        if (throttleBeforeDecrement > 0)
+        {
+            std::uint64_t toSleepForMs = std::ceil(static_cast<float>(throttleBeforeDecrement) / 30) * 20;
+            std::this_thread::sleep_for(std::chrono::milliseconds(toSleepForMs));
+        }
+
         auto start = std::chrono::high_resolution_clock::now();
         responseString->clear();
         curl_easy_setopt(curl, CURLOPT_URL, std::string("https://en.wikipedia.org" + toFetch).c_str());
@@ -43,7 +59,8 @@ void fetchPages(LinksToCurlQueue& inQueue, HtmlToParseQueue& outQueue)
     curl_easy_cleanup(curl);
 }
 
-void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToSerializeQueue& pagesQueue)
+void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToSerializeQueue& pagesQueue,
+               std::atomic<std::uint64_t>& throttleQuantity, std::uint8_t numberOfCurlThreads)
 {
     std::pair<std::string, std::string> fetchedData;
     std::string links;
@@ -53,6 +70,9 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
 
     while (true)
     {
+        lxb_dom_collection_clean(collection);
+        lxb_html_document_clean(document);
+
         if (inQueue.pop(fetchedData))
         {
             outQueue.quit();
@@ -71,8 +91,25 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
         }
 
         auto body = lxb_dom_interface_element(document->body);
-        status = lxb_dom_elements_by_attr_begin(body, collection, (const lxb_char_t*)"href", 4, (const lxb_char_t*)"/wiki", 5, true);
 
+        // Check if page is error
+        std::size_t titleLen;
+        const char* title = (const char*)lxb_html_document_title_raw(document, &titleLen);
+        if (title != nullptr)
+        {
+            if (std::string_view(title, titleLen) == "Wikimedia Error")
+            {
+                // WE ARE GETTING THROTTLED
+                std::cout << "GETTING THROTTLED!!! SLOWING DOWN!\n";
+                throttleQuantity += numberOfCurlThreads * 4;
+                // Put back the link in the queue to re fetch later
+                outQueue.push(pageName);
+                continue;
+            }
+        }
+
+        // Parse page
+        status = lxb_dom_elements_by_attr_begin(body, collection, (const lxb_char_t*)"href", 4, (const lxb_char_t*)"/wiki", 5, true);
         if (status != LXB_STATUS_OK)
         {
             std::cerr << "Error while parsing HTML" << std::endl;
@@ -84,7 +121,8 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
         for (size_t i = 0; i < lxb_dom_collection_length(collection); i++)
         {
             auto element = lxb_dom_collection_element(collection, i);
-            const char* link = (const char*)lxb_dom_element_get_attribute(element, reinterpret_cast<const unsigned char*>("href"), 4, nullptr);
+            const char* link =
+                (const char*)lxb_dom_element_get_attribute(element, reinterpret_cast<const unsigned char*>("href"), 4, nullptr);
             if (outQueue.push(std::string((const char*)link)))
             {
                 quit = true;
@@ -102,7 +140,7 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
             std::cout << "Terminating parse" << std::endl;
             break;
         }
-        
+
         if (pagesQueue.push({pageName, links}))
         {
             inQueue.quit();
@@ -110,20 +148,23 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
             std::cout << "Terminating parse" << std::endl;
             break;
         }
-
-        lxb_dom_collection_clean(collection);
-        lxb_html_document_clean(document);
     }
     lxb_dom_collection_destroy(collection, true);
     lxb_html_document_destroy(document);
 }
 
-void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, LinksToCurlQueue& curlQueue, std::condition_variable& deserializeCondition)
+void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, LinksToCurlQueue& curlQueue,
+                 std::condition_variable& deserializeCondition, std::vector<std::string>& disallowedLinks)
 {
     std::unordered_set<std::string> visited{};
     std::string toFilter;
     std::size_t totalMs;
     std::size_t n{};
+
+    disallowedLinks.push_back("/wiki/Category:");
+    disallowedLinks.push_back("/wiki/File:");
+    disallowedLinks.push_back("/wiki/Wikipedia:");
+
     auto start = std::chrono::high_resolution_clock::now();
 
     while (true)
@@ -152,22 +193,11 @@ void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, Li
             continue;
         }
 
-        if (toFilter.starts_with("/wiki/Category:"))
-        {
-            continue;
-        }
+        const bool isDisallowed = std::any_of(disallowedLinks.cbegin(),
+                                              disallowedLinks.cend(),
+                                              [&toFilter](const auto& disallowedLink) { return toFilter.starts_with(disallowedLink); });
 
-        if (toFilter.starts_with("/wiki/File:"))
-        {
-            continue;
-        }
-
-        if (toFilter.starts_with("/wiki/Wikipedia:"))
-        {
-            continue;
-        }
-
-        if (toFilter.starts_with("/wiki/Special:"))
+        if (isDisallowed)
         {
             continue;
         }
@@ -204,7 +234,7 @@ void dispatchLinks(LinksToDispatchQueue& inQueue, LinksToCurlQueue& curlQueue, L
             break;
         }
 
-        if (fullness > 0.90f)
+        if (fullness > 0.98f)
         {
             if (serializeQueue.push(link))
             {
@@ -261,8 +291,9 @@ void serializeLinks(LinksToSerializeQueue& inQueue, const std::string& linksFold
     }
 }
 
-void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlQueue& curlQueue, std::unordered_set<std::string>& activeFiles, std::mutex& filemutex,
-                      std::mutex& conditionMutex, std::condition_variable& deserializeCondition, std::atomic<bool>& quitDeserialize, const std::string& linksFolder)
+void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlQueue& curlQueue, std::unordered_set<std::string>& activeFiles,
+                      std::mutex& filemutex, std::mutex& conditionMutex, std::condition_variable& deserializeCondition,
+                      std::atomic<bool>& quitDeserialize, const std::string& linksFolder)
 {
     std::string pathStr;
     while (true)
@@ -397,20 +428,65 @@ std::pair<std::string, std::string> prepDataFolder(const std::string_view dataFo
     return {linksToCurl, pagesData};
 }
 
+auto parseRobotsTxt()
+{
+    auto [curl, responseString] = initCurl();
+    curl_easy_setopt(curl, CURLOPT_URL, "https://en.wikipedia.org/robots.txt");
+    curl_easy_perform(curl);
+    std::stringstream stream(*responseString);
+
+    bool foundOurUserAgent = false;
+    std::string line;
+    std::vector<std::string> disallowedLinks;
+    while (std::getline(stream, line))
+    {
+        if (foundOurUserAgent == false)
+        {
+            if (line == "User-agent: *")
+            {
+                foundOurUserAgent = true;
+            }
+        }
+        else
+        {
+            if (line.starts_with("#") || line.starts_with(" #"))
+            {
+                continue;
+            }
+            if (line.starts_with("User-agent"))
+            {
+                break;
+            }
+            if (line.starts_with("Disallow: "))
+            {
+                std::string disallowedLink = line.substr(strlen("Disallow: "), std::string::npos);
+                disallowedLinks.push_back(disallowedLink);
+            }
+        }
+    }
+
+    curl_easy_cleanup(curl);
+    return disallowedLinks;
+}
+
 int main(int argc, char** argv)
 {
+    std::vector<std::string> disallowedLinks = parseRobotsTxt();
     auto [linksFolder, dataFolder] = prepDataFolder(argc < 3 ? "data/" : argv[2]);
 
     std::vector<std::thread> threads;
     threads.reserve(64);
 
     // Curl threads
+
+    std::atomic<std::uint64_t> throttleQuantity = 0;
     LinksToCurlQueue toCurl{};
     HtmlToParseQueue toParse{};
     toCurl.push(std::string(argc <= 2 ? "/wiki/Sun" : argv[1]));
+    const std::uint8_t numberOfCurlThreads = 30;
     for (auto i = 0UL; i < 30; i++)
     {
-        threads.emplace_back(fetchPages, std::ref(toCurl), std::ref(toParse));
+        threads.emplace_back(fetchPages, std::ref(toCurl), std::ref(toParse), std::ref(throttleQuantity));
     }
 
     // Parsing threads
@@ -418,18 +494,25 @@ int main(int argc, char** argv)
     LinksToFilterQueue toFilter{};
     for (auto i = 0UL; i < 10; i++)
     {
-        threads.emplace_back(parseHtml, std::ref(toParse), std::ref(toFilter), std::ref(pagesToSerialize));
+        threads.emplace_back(
+            parseHtml, std::ref(toParse), std::ref(toFilter), std::ref(pagesToSerialize), std::ref(throttleQuantity), numberOfCurlThreads);
     }
 
     // Filter thread (did we already visit that link?)
     std::condition_variable deserializeCondition;
     LinksToDispatchQueue toDispatch{};
-    threads.emplace_back(filterLinks, std::ref(toFilter), std::ref(toDispatch), std::ref(toCurl), std::ref(deserializeCondition));
+    threads.emplace_back(
+        filterLinks, std::ref(toFilter), std::ref(toDispatch), std::ref(toCurl), std::ref(deserializeCondition), std::ref(disallowedLinks));
 
     // Dispatching threads (should a link be serialized or be kept in memory?)
     LinksToSerializeQueue toSerialize{};
     std::atomic<bool> quitDeserialize = false;
-    threads.emplace_back(dispatchLinks, std::ref(toDispatch), std::ref(toCurl), std::ref(toSerialize), std::ref(deserializeCondition), std::ref(quitDeserialize));
+    threads.emplace_back(dispatchLinks,
+                         std::ref(toDispatch),
+                         std::ref(toCurl),
+                         std::ref(toSerialize),
+                         std::ref(deserializeCondition),
+                         std::ref(quitDeserialize));
 
     // Serializing threads
     threads.emplace_back(serializeLinks, std::ref(toSerialize), std::ref(linksFolder));
@@ -476,7 +559,8 @@ int main(int argc, char** argv)
         auto now = std::chrono::high_resolution_clock::now();
         auto duration = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
         auto averageDuration = duration / pageCount;
-        
+
+        std::cout << "Queues fullness:\n";
         std::cout << "To curl:                " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
         std::cout << "To parse:               " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
         std::cout << "To filter:              " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
