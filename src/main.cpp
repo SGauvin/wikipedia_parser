@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <signal.h>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -12,13 +14,15 @@
 #include "init_curl.h"
 #include "thread_safe_queue.h"
 
-using LinksToCurlThrottleQueue = ThreadSafeQueueFixedSize<std::string, 4096 * 4>;
+using LinksToCurlThrottleQueue = ThreadSafeQueueFixedSize<std::string, 256>;
 using LinksToCurlQueue = ThreadSafeQueueFixedSize<std::string, 256>;
 using HtmlToParseQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 64>;
-using LinksToFilterQueue = ThreadSafeQueueFixedSize<std::string, 4096>;
-using LinksToDispatchQueue = ThreadSafeQueueFixedSize<std::string, 2048>;
-using LinksToSerializeQueue = ThreadSafeQueueFixedSize<std::string, 4096>;
+using LinksToFilterQueue = ThreadSafeQueueFixedSize<std::string, 256>;
+using LinksToDispatchQueue = ThreadSafeQueueFixedSize<std::string, 256>;
+using LinksToSerializeQueue = ThreadSafeQueueFixedSize<std::string, 1024>;
 using PagesToSerializeQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 256>;
+
+std::atomic<bool> shouldStop{false};
 
 void fetchPages(LinksToCurlQueue& inQueue, HtmlToParseQueue& outQueue, std::atomic<std::uint64_t>& throttleQuantity)
 {
@@ -74,6 +78,7 @@ void throttleFetch(std::chrono::microseconds durationToWaitBetweenSends, std::ui
     auto timestamp = std::chrono::high_resolution_clock::now();
     auto timeToSleepTotal = std::chrono::microseconds(0);
     std::string link;
+
     while (true)
     {
         if (inQueue.pop(link))
@@ -104,34 +109,6 @@ void throttleFetch(std::chrono::microseconds durationToWaitBetweenSends, std::ui
             std::this_thread::sleep_for(timeToSleepTotal);
         }
     }
-}
-
-void dispatchLinksToCurl(LinksToCurlThrottleQueue& inQueue, HtmlToParseQueue& outQueue, std::atomic<std::uint64_t>& throttleQuantity)
-{
-    auto [curl, responseString] = initCurl();
-    std::string toFetch;
-
-    while (true)
-    {
-        if (inQueue.pop(toFetch))
-        {
-            outQueue.quit();
-            std::cout << "Terminating fetch" << std::endl;
-            break;
-        }
-
-        responseString->clear();
-        curl_easy_setopt(curl, CURLOPT_URL, std::string("https://en.wikipedia.org" + toFetch).c_str());
-        curl_easy_perform(curl);
-        auto end = std::chrono::high_resolution_clock::now();
-        if (outQueue.push({toFetch, *responseString}))
-        {
-            inQueue.quit();
-            std::cout << "Terminating fetch" << std::endl;
-            break;
-        }
-    }
-    curl_easy_cleanup(curl);
 }
 
 void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToSerializeQueue& pagesQueue,
@@ -242,7 +219,7 @@ void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, Li
     while (true)
     {
         const float fullness = static_cast<float>(curlQueue.size()) / curlQueue.capacity();
-        if (fullness < 0.75f)
+        if (fullness < 0.5f)
         {
             deserializeCondition.notify_one();
         }
@@ -291,7 +268,7 @@ void dispatchLinks(LinksToDispatchQueue& inQueue, LinksToCurlThrottleQueue& curl
     while (true)
     {
         const float fullness = static_cast<float>(curlQueue.size()) / curlQueue.capacity();
-        if (fullness < 0.75f)
+        if (fullness < 0.75f && shouldStop == false)
         {
             deserializeCondition.notify_one();
         }
@@ -306,7 +283,7 @@ void dispatchLinks(LinksToDispatchQueue& inQueue, LinksToCurlThrottleQueue& curl
             break;
         }
 
-        if (fullness > 0.98f)
+        if (fullness > 0.98f || shouldStop == true)
         {
             if (serializeQueue.push(link))
             {
@@ -337,7 +314,7 @@ void serializeLinks(LinksToSerializeQueue& inQueue, const std::string& linksFold
 {
     std::atomic<std::uint32_t> counter = 0;
     std::vector<std::string> links;
-    links.resize(1024);
+    links.resize(std::min(256ul, inQueue.capacity() / 2));
 
     while (true)
     {
@@ -350,6 +327,7 @@ void serializeLinks(LinksToSerializeQueue& inQueue, const std::string& linksFold
         std::uint32_t fileNumber = counter.fetch_add(1);
         std::string file = std::filesystem::path(linksFolder) / std::filesystem::path(std::to_string(fileNumber));
         std::ofstream stream(file);
+
         if (!stream)
         {
             std::cerr << "Couldn't create file " << fileNumber << std::endl;
@@ -370,13 +348,23 @@ void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue
     std::string pathStr;
     while (true)
     {
+        if (shouldStop == true)
+        {
+            return;
+        }
+
         std::unique_lock<std::mutex> guard(conditionMutex);
         deserializeCondition.wait(guard,
                                   [&]
                                   {
                                       const float fullness = static_cast<float>(curlQueue.size() - 1) / curlQueue.capacity();
-                                      return fullness < 0.80f || quitDeserialize == true;
+                                      return fullness < 0.50f || quitDeserialize == true;
                                   });
+
+        if (shouldStop == true)
+        {
+            return;
+        }
 
         if (quitDeserialize == true)
         {
@@ -541,8 +529,32 @@ auto parseRobotsTxt()
     return disallowedLinks;
 }
 
+void handleSigInt()
+{
+    struct sigaction sigIntHandler;
+    sigIntHandler.sa_handler = [](std::int32_t s)
+    {
+        if (shouldStop == false)
+        {
+            std::cout << "\nCTRL-C detected, waiting for queues to empty\n";
+            shouldStop.store(true);
+        }
+        else
+        {
+            std::cout << "\nDidn't know you were chill like that\n";
+            exit(1);
+        }
+    };
+
+    sigemptyset(&sigIntHandler.sa_mask);
+    sigIntHandler.sa_flags = 0;
+    sigaction(SIGINT, &sigIntHandler, nullptr);
+}
+
 int main(int argc, char** argv)
 {
+    handleSigInt();
+
     std::vector<std::string> disallowedLinks = parseRobotsTxt();
     auto [linksFolder, dataFolder] = prepDataFolder(argc < 3 ? "data/" : argv[2]);
 
@@ -636,7 +648,8 @@ int main(int argc, char** argv)
         }
 
         std::uint32_t pageCount = pageSerializingCounter.load(std::memory_order_relaxed);
-        while(!pageSerializingCounter.compare_exchange_weak(pageCount, 0, std::memory_order_relaxed, std::memory_order_relaxed));
+        while (!pageSerializingCounter.compare_exchange_weak(pageCount, 0, std::memory_order_relaxed, std::memory_order_relaxed))
+            ;
         totalPagesSerialized += pageCount;
 
         auto now = std::chrono::high_resolution_clock::now();
