@@ -31,17 +31,16 @@ public:
     {
         std::unique_lock<std::mutex> guardPush(m_mutex);
         m_dataConditionPush.wait(guardPush, [this] { return m_size > 0 || m_quit == true; });
-        if (m_quit == true)
+        
+        if (m_size > 0)
         {
-            return true;
+            m_size--;
+            retval = m_data[m_offset];
+            m_offset = (m_offset + 1) % m_data.size();
+            m_dataConditionPop.notify_one();
         }
 
-        m_size--;
-        retval = m_data[m_offset];
-        m_offset = (m_offset + 1) % m_data.size();
-        m_dataConditionPop.notify_one();
-        
-        return false;
+        return m_quit;
     }
 
     bool pop(std::vector<T>& retval)

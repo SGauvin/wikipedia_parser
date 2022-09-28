@@ -16,8 +16,8 @@
 
 using LinksToCurlThrottleQueue = ThreadSafeQueueFixedSize<std::string, 256>;
 using LinksToCurlQueue = ThreadSafeQueueFixedSize<std::string, 256>;
-using HtmlToParseQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 64>;
-using LinksToFilterQueue = ThreadSafeQueueFixedSize<std::string, 256>;
+using HtmlToParseQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 256>;
+using LinksToFilterQueue = ThreadSafeQueueFixedSize<std::string, 512>;
 using LinksToDispatchQueue = ThreadSafeQueueFixedSize<std::string, 256>;
 using LinksToSerializeQueue = ThreadSafeQueueFixedSize<std::string, 1024>;
 using PagesToSerializeQueue = ThreadSafeQueueFixedSize<std::pair<std::string, std::string>, 256>;
@@ -342,6 +342,29 @@ void serializeLinks(LinksToSerializeQueue& inQueue, const std::string& linksFold
             stream << link << '\n';
         }
     }
+
+    if (inQueue.size() == 0)
+    {
+        return;
+    }
+
+    std::uint32_t fileNumber = counter.fetch_add(1);
+    std::string file = std::filesystem::path(linksFolder) / std::filesystem::path(std::to_string(fileNumber));
+    std::ofstream stream(file);
+
+    if (!stream)
+    {
+        std::cerr << "Couldn't create file " << fileNumber << std::endl;
+        exit(1);
+    }
+
+    std::string link;
+    while (inQueue.size() != 0)
+    {
+        inQueue.pop(link);
+        stream << link << '\n';
+    }
+    std::cout << "Done serializing last links\n";
 }
 
 void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue& curlQueue, std::unordered_set<std::string>& activeFiles,
@@ -675,7 +698,8 @@ int main(int argc, char** argv)
         std::cout << "Queues fullness:\n";
         std::cout << "To curl (throttled):      " << static_cast<float>(toCurlThrottle.size()) / toCurlThrottle.capacity() << '\n';
         std::cout << "To curl:                  " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
-        std::cout << "To parse:                 " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
+        std::cout << "To parse:                 " << static_cast<float>(toParse.size()) / toParse.capacity();
+        std::cout << " [" << toParse.size() << '/' << toParse.capacity() << "]\n";
         std::cout << "To filter:                " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
         std::cout << "To dispatch:              " << static_cast<float>(toDispatch.size()) / toDispatch.capacity() << '\n';
         std::cout << "To serialize:             " << static_cast<float>(toSerialize.size()) / toSerialize.capacity() << '\n';
@@ -683,7 +707,7 @@ int main(int argc, char** argv)
         std::cout << "Number of fetches:        " << pageCount << " in the last " << durationSinceLast / 1000 << "s\n";
         std::cout << "% of new links:           " << static_cast<float>(newLinksCount) / (newLinksCount + visitedLinks) * 100 << "%";
         std::cout << " [" << newLinksCount << '/' << newLinksCount + visitedLinks << "]\n";
-        std::cout << "Fetch duration average:   " << averageDuration << "ms\n";
+        std::cout << "Fetch duration average:   " << averageDuration << "ms [" << 1000 / averageDuration << "req/s]\n";
         std::cout << "Total pages serialized:   " << totalPagesSerialized << '\n';
         std::cout << "Time elapsed since start: " << durationSinceStart / 1000 << "s\n";
         std::cout << "---\n";
