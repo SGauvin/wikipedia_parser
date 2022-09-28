@@ -205,12 +205,12 @@ void parseHtml(HtmlToParseQueue& inQueue, LinksToFilterQueue& outQueue, PagesToS
 }
 
 void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, LinksToCurlThrottleQueue& curlQueue,
-                 std::condition_variable& deserializeCondition, std::vector<std::string>& disallowedLinks)
+                 std::condition_variable& deserializeCondition, std::vector<std::string>& disallowedLinks,
+                 std::atomic<std::uint32_t>& goodLinksCount, std::atomic<std::uint32_t>& visitedLinksCount)
 {
     std::unordered_set<std::string> visited{};
     std::string toFilter;
     std::size_t totalMs;
-    std::size_t n{};
 
     disallowedLinks.push_back("/wiki/Category:");
     disallowedLinks.push_back("/wiki/File:");
@@ -239,6 +239,7 @@ void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, Li
 
         if (visited.contains(toFilter))
         {
+            visitedLinksCount++;
             continue;
         }
 
@@ -250,6 +251,8 @@ void filterLinks(LinksToFilterQueue& inQueue, LinksToDispatchQueue& outQueue, Li
         {
             continue;
         }
+
+        goodLinksCount++;
 
         visited.insert(toFilter);
         if (outQueue.push(toFilter))
@@ -586,6 +589,8 @@ int main(int argc, char** argv)
     }
 
     // Filter thread (did we already visit that link?)
+    std::atomic<std::uint32_t> goodLinksCount = 0;
+    std::atomic<std::uint32_t> visitedLinksCount = 0;
     std::condition_variable deserializeCondition;
     LinksToDispatchQueue toDispatch{};
     threads.emplace_back(filterLinks,
@@ -593,7 +598,9 @@ int main(int argc, char** argv)
                          std::ref(toDispatch),
                          std::ref(toCurlThrottle),
                          std::ref(deserializeCondition),
-                         std::ref(disallowedLinks));
+                         std::ref(disallowedLinks),
+                         std::ref(goodLinksCount),
+                         std::ref(visitedLinksCount));
 
     // Dispatching threads (should a link be serialized or be kept in memory?)
     LinksToSerializeQueue toSerialize{};
@@ -633,7 +640,7 @@ int main(int argc, char** argv)
     {
         auto start = std::chrono::high_resolution_clock::now();
 
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
         if (toCurlThrottle.size() == 0 && pagesToSerialize.size() == 0)
         {
             count++;
@@ -652,6 +659,14 @@ int main(int argc, char** argv)
             ;
         totalPagesSerialized += pageCount;
 
+        std::uint32_t newLinksCount = goodLinksCount.load(std::memory_order_relaxed);
+        while (!goodLinksCount.compare_exchange_weak(newLinksCount, 0))
+            ;
+
+        std::uint32_t visitedLinks = visitedLinksCount.load(std::memory_order_relaxed);
+        while (!visitedLinksCount.compare_exchange_weak(visitedLinks, 0))
+            ;
+
         auto now = std::chrono::high_resolution_clock::now();
         auto durationSinceLast = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
         auto averageDuration = durationSinceLast / pageCount;
@@ -659,13 +674,15 @@ int main(int argc, char** argv)
 
         std::cout << "Queues fullness:\n";
         std::cout << "To curl (throttled):      " << static_cast<float>(toCurlThrottle.size()) / toCurlThrottle.capacity() << '\n';
-        std::cout << "To curl :                 " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
+        std::cout << "To curl:                  " << static_cast<float>(toCurl.size()) / toCurl.capacity() << '\n';
         std::cout << "To parse:                 " << static_cast<float>(toParse.size()) / toParse.capacity() << '\n';
         std::cout << "To filter:                " << static_cast<float>(toFilter.size()) / toFilter.capacity() << '\n';
         std::cout << "To dispatch:              " << static_cast<float>(toDispatch.size()) / toDispatch.capacity() << '\n';
         std::cout << "To serialize:             " << static_cast<float>(toSerialize.size()) / toSerialize.capacity() << '\n';
         std::cout << "To serialize pages:       " << static_cast<float>(pagesToSerialize.size()) / pagesToSerialize.capacity() << '\n';
         std::cout << "Number of fetches:        " << pageCount << " in the last " << durationSinceLast / 1000 << "s\n";
+        std::cout << "% of new links:           " << static_cast<float>(newLinksCount) / (newLinksCount + visitedLinks) * 100 << "%";
+        std::cout << " [" << newLinksCount << '/' << newLinksCount + visitedLinks << "]\n";
         std::cout << "Fetch duration average:   " << averageDuration << "ms\n";
         std::cout << "Total pages serialized:   " << totalPagesSerialized << '\n';
         std::cout << "Time elapsed since start: " << durationSinceStart / 1000 << "s\n";
