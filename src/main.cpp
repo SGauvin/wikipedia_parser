@@ -286,7 +286,8 @@ void dispatchLinks(LinksToDispatchQueue& inQueue, LinksToCurlThrottleQueue& curl
             break;
         }
 
-        if (fullness > 0.98f || shouldStop == true)
+        // if (fullness > 0.98f || shouldStop == true)
+        if (true)
         {
             if (serializeQueue.push(link))
             {
@@ -367,9 +368,9 @@ void serializeLinks(LinksToSerializeQueue& inQueue, const std::string& linksFold
     std::cout << "Done serializing last links\n";
 }
 
-void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue& curlQueue, std::unordered_set<std::string>& activeFiles,
-                      std::mutex& filemutex, std::mutex& conditionMutex, std::condition_variable& deserializeCondition,
-                      std::atomic<bool>& quitDeserialize, const std::string& linksFolder)
+void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue& curlQueueThrottle,
+                      std::unordered_set<std::string>& activeFiles, std::mutex& filemutex, std::mutex& conditionMutex,
+                      std::condition_variable& deserializeCondition, std::atomic<bool>& quitDeserialize, const std::string& linksFolder)
 {
     std::string pathStr;
     while (true)
@@ -383,7 +384,8 @@ void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue
         deserializeCondition.wait(guard,
                                   [&]
                                   {
-                                      const float fullness = static_cast<float>(curlQueue.size() - 1) / curlQueue.capacity();
+                                      const float fullness =
+                                          static_cast<float>(curlQueueThrottle.size()) / curlQueueThrottle.capacity();
                                       return fullness < 0.50f || quitDeserialize == true;
                                   });
 
@@ -396,7 +398,7 @@ void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue
         {
             std::cout << "Terminating deserialize" << std::endl;
             toDispatch.quit();
-            curlQueue.quit();
+            curlQueueThrottle.quit();
             break;
         }
 
@@ -432,7 +434,7 @@ void deserializeLinks(LinksToDispatchQueue& toDispatch, LinksToCurlThrottleQueue
         std::cout << "Deserializing page << " << pathStr << "\n";
         while (stream >> link)
         {
-            if (curlQueue.push(link))
+            if (curlQueueThrottle.push(link))
             {
                 quit = true;
                 break;
@@ -472,7 +474,7 @@ void serializePage(PagesToSerializeQueue& inQueue, const std::string& dataFolder
             break;
         }
         auto& [pageName, pageLinks] = toSerialize;
-        std::replace(pageName.begin(), pageName.end(), '/', '_');
+        std::replace(pageName.begin(), pageName.end(), '/', '\\');
 
         std::string_view realPageName = [&]
         {
@@ -496,7 +498,7 @@ void serializePage(PagesToSerializeQueue& inQueue, const std::string& dataFolder
     }
 }
 
-std::pair<std::string, std::string> prepDataFolder(const std::string_view dataFolder)
+std::tuple<std::string, std::string, std::string> prepDataFolder(const std::string_view dataFolder)
 {
     if (std::filesystem::exists(dataFolder))
     {
@@ -511,7 +513,10 @@ std::pair<std::string, std::string> prepDataFolder(const std::string_view dataFo
     std::string pagesData = std::filesystem::path(dataFolder) / "wiki_data";
     std::filesystem::create_directory(pagesData);
 
-    return {linksToCurl, pagesData};
+    std::string new_links = std::filesystem::path(dataFolder) / "new_links";
+    std::filesystem::create_directory(new_links);
+
+    return {linksToCurl, pagesData, new_links};
 }
 
 auto parseRobotsTxt()
@@ -582,7 +587,7 @@ int main(int argc, char** argv)
     handleSigInt();
 
     std::vector<std::string> disallowedLinks = parseRobotsTxt();
-    auto [linksFolder, dataFolder] = prepDataFolder(argc < 3 ? "data/" : argv[2]);
+    auto [linksFolder, dataFolder, new_links] = prepDataFolder(argc < 3 ? "data/" : argv[2]);
 
     std::vector<std::thread> threads;
     threads.reserve(64);
@@ -590,8 +595,8 @@ int main(int argc, char** argv)
     // Throttle
     LinksToCurlQueue toCurl{};
     LinksToCurlThrottleQueue toCurlThrottle{};
-    toCurlThrottle.push(std::string(argc <= 2 ? "/wiki/Sun" : argv[1]));
-    threads.emplace_back(throttleFetch, std::chrono::milliseconds(0), 2, std::ref(toCurlThrottle), std::ref(toCurl));
+    // toCurlThrottle.push(std::string(argc <= 2 ? "/wiki/Sun" : argv[1]));
+    threads.emplace_back(throttleFetch, std::chrono::milliseconds(40), 2, std::ref(toCurlThrottle), std::ref(toCurl));
 
     // Curl threads
     std::atomic<std::uint64_t> throttleQuantity = 0;
@@ -636,7 +641,7 @@ int main(int argc, char** argv)
                          std::ref(quitDeserialize));
 
     // Serializing threads
-    threads.emplace_back(serializeLinks, std::ref(toSerialize), std::ref(linksFolder));
+    threads.emplace_back(serializeLinks, std::ref(toSerialize), std::ref(new_links));
 
     // Deserialize (when we are running out of links to visit in the memory, fetch them from the disk)
     std::unordered_set<std::string> activeFiles;
@@ -667,10 +672,11 @@ int main(int argc, char** argv)
         if (toCurlThrottle.size() == 0 && pagesToSerialize.size() == 0)
         {
             count++;
-            if (count == 3)
+            if (count == 40)
             {
                 break;
             }
+            deserializeCondition.notify_one();
         }
         else
         {

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/wikipedia_parser.dir/src/main.cpp.o -o wikipedia_parser  /usr/lib/x86_64-linux-gnu/libcurl.so libs/lexbor/liblexbor_static.a 
